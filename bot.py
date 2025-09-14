@@ -10,12 +10,19 @@ from telegram import (
 from telegram.constants import ParseMode
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 from textwrap import dedent
+import ast
 
 # Для ИИ
 try:
     from openai import OpenAI  # type: ignore
 except Exception:  # библиотека может быть не установлена локально
     OpenAI = None  # будет проверка в рантайме
+
+# Gemini (бесплатная альтернатива)
+try:
+    import google.generativeai as genai  # type: ignore
+except Exception:
+    genai = None
 
 # =====================
 # Настройка логирования
@@ -166,8 +173,18 @@ def get_openai_client() -> "OpenAI":
     return OpenAI(api_key=api_key)
 
 
-async def ai_generate(subject: str, task_text: str) -> str:
-    """Запрос к ИИ с безопасным промптом и ограничением длины ответа."""
+def get_gemini_model():
+    api_key = os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        raise RuntimeError("Не найден GOOGLE_API_KEY. Задайте ключ для использования Gemini.")
+    if genai is None:
+        raise RuntimeError("Библиотека google-generativeai не установлена. Добавьте её в requirements.txt.")
+    genai.configure(api_key=api_key)
+    model_name = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+    return genai.GenerativeModel(model_name)
+
+
+async def ai_generate_openai(subject: str, task_text: str) -> str:
     client = get_openai_client()
     system = dedent(f"""
         Ты — дружелюбный репетитор. Предмет: {SUPPORTED_SUBJECTS.get(subject, subject)}.
@@ -178,22 +195,58 @@ async def ai_generate(subject: str, task_text: str) -> str:
     """)
     user = task_text.strip()
 
-    # Модель можно заменить на любую доступную
+    preferred = os.getenv("OPENAI_MODEL")
+    candidates = [m for m in [preferred, "gpt-4o-mini", "gpt-4o"] if m]
+    last_err: Exception | None = None
+    for model in candidates:
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+                temperature=0.3,
+                max_tokens=900,
+            )
+            content = resp.choices[0].message.content or ""
+            return content
+        except Exception as e:
+            last_err = e
+            logger.warning(f"Ошибка запроса модели {model}: {e}")
+            continue
+    logger.exception("Ошибка вызова OpenAI на всех моделях", exc_info=last_err)
+    return f"Ошибка ИИ: {last_err}"
+
+
+async def ai_generate_gemini(subject: str, task_text: str) -> str:
+    model = get_gemini_model()
+    system = dedent(f"""
+        Ты — дружелюбный репетитор. Предмет: {SUPPORTED_SUBJECTS.get(subject, subject)}.
+        Объясняй пошагово, ясно и кратко. Если запрос — сочинение, делай оригинальный текст.
+        Если задача математическая — показывай ход решения и проверку.
+        Если данных недостаточно — попроси уточнения.
+        Язык ответа: русский.
+    """)
+    prompt = system + "\n\nПользовательский запрос:\n" + task_text.strip()
     try:
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            temperature=0.3,
-            max_tokens=900,
-        )
-        content = resp.choices[0].message.content or ""
+        resp = model.generate_content(prompt)
+        return resp.text or ""
     except Exception as e:
-        logger.exception("Ошибка вызова OpenAI")
-        content = f"Ошибка ИИ: {e}"
-    return content
+        logger.exception("Ошибка вызова Gemini")
+        return f"Ошибка ИИ (Gemini): {e}"
+
+
+async def ai_generate(subject: str, task_text: str) -> str:
+    provider = os.getenv("PROVIDER", "gemini").lower()
+    if provider == "openai":
+        return await ai_generate_openai(subject, task_text)
+    # По умолчанию пробуем Gemini (часто доступен с бесплатной квотой)
+    result = await ai_generate_gemini(subject, task_text)
+    # Если у Gemini нет ключа/ошибка, попробуем OpenAI (если настроен)
+    if result.startswith("Ошибка ИИ (Gemini)") and os.getenv("OPENAI_API_KEY"):
+        return await ai_generate_openai(subject, task_text)
+    return result
 
 
 def split_long(text: str, limit: int = 3500) -> List[str]:
@@ -212,6 +265,61 @@ def split_long(text: str, limit: int = 3500) -> List[str]:
     if not parts:
         parts = [text]
     return parts
+
+
+# =====================
+# Локальный решатель простых выражений
+# =====================
+ALLOWED_BINOPS = (ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Pow, ast.FloorDiv, ast.Mod)
+ALLOWED_UNARY = (ast.UAdd, ast.USub)
+
+
+def _eval_ast(node: ast.AST) -> float:
+    if isinstance(node, ast.Expression):
+        return _eval_ast(node.body)
+    if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+        return float(node.value)
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ALLOWED_UNARY):
+        return +_eval_ast(node.operand) if isinstance(node.op, ast.UAdd) else -_eval_ast(node.operand)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ALLOWED_BINOPS):
+        left = _eval_ast(node.left)
+        right = _eval_ast(node.right)
+        if isinstance(node.op, ast.Add):
+            return left + right
+        if isinstance(node.op, ast.Sub):
+            return left - right
+        if isinstance(node.op, ast.Mult):
+            return left * right
+        if isinstance(node.op, ast.Div):
+            return left / right
+        if isinstance(node.op, ast.FloorDiv):
+            return left // right
+        if isinstance(node.op, ast.Mod):
+            return left % right
+        if isinstance(node.op, ast.Pow):
+            return left ** right
+    raise ValueError("Недопустимое выражение")
+
+
+def try_eval_simple_math(expr: str) -> str | None:
+    s = expr.strip()
+    if not s:
+        return None
+    # Заменим ^ на ** для степеней
+    s = s.replace('^', '**')
+    # Разрешим только цифры, пробелы, точки и операции/скобки
+    if not all(ch.isdigit() or ch in ' .+-*/()%**' or ch in '()' for ch in s):
+        # Если есть буквы/другие символы — считаем, что это не простая арифметика
+        pass
+    try:
+        tree = ast.parse(s, mode='eval')
+        val = _eval_ast(tree)
+        # Красиво отформатируем: если целое — без .0
+        if abs(val - int(val)) < 1e-9:
+            return str(int(val))
+        return str(val)
+    except Exception:
+        return None
 
 
 # =====================
@@ -250,10 +358,21 @@ async def solve_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "Пришлите задачу текстом после команды. Пример:\n/solve Найди корни уравнения x^2 - 5x + 6 = 0"
         )
         return
+    # Сначала пробуем локально посчитать простую арифметику (без ИИ)
+    simple = try_eval_simple_math(query)
+    if simple is not None:
+        await update.message.reply_text(f"Ответ: {simple}")
+        return
     await update.message.reply_text("Думаю над решением…")
-    answer = await ai_generate(subject, f"Задача по предмету '{subject}': {query}")
-    for part in split_long(answer):
-        await update.message.reply_text(part, parse_mode=ParseMode.HTML)
+    try:
+        answer = await ai_generate(subject, f"Задача по предмету '{subject}': {query}")
+        for part in split_long(answer):
+            await update.message.reply_text(part, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        logger.exception("Ошибка решения задачи")
+        await update.message.reply_text(
+            f"Не удалось получить ответ ИИ: {e}\nПроверьте OPENAI_API_KEY и установлен ли пакет openai, затем попробуйте снова."
+        )
 
 
 async def essay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -270,9 +389,15 @@ async def essay_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
        Объём: 200–300 слов. Структура: вступление, 2–3 абзаца основная часть, заключение.
         Избегай плагиата, не используй клише. Язык: русский.
     """)
-    answer = await ai_generate(subject, prompt)
-    for part in split_long(answer):
-        await update.message.reply_text(part, parse_mode=ParseMode.HTML)
+    try:
+        answer = await ai_generate(subject, prompt)
+        for part in split_long(answer):
+            await update.message.reply_text(part, parse_mode=ParseMode.HTML)
+    except Exception as e:
+        logger.exception("Ошибка генерации сочинения")
+        await update.message.reply_text(
+            f"Не удалось получить ответ ИИ: {e}\nПроверьте OPENAI_API_KEY и установлен ли пакет openai, затем попробуйте снова."
+        )
 
 
 async def today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
