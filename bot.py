@@ -4,7 +4,9 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, List
 
 from dotenv import load_dotenv
-from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram import (
+    Update,
+)
 from telegram.constants import ParseMode
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
@@ -94,18 +96,6 @@ DAY_ALIASES = {
 
 RUS_WEEK_ORDER = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота"]
 
-# Клавиатура
-MAIN_KEYBOARD = ReplyKeyboardMarkup(
-    [
-        [KeyboardButton("Сегодня"), KeyboardButton("Завтра")],
-        [KeyboardButton("Понедельник"), KeyboardButton("Вторник")],
-        [KeyboardButton("Среда"), KeyboardButton("Четверг")],
-        [KeyboardButton("Пятница"), KeyboardButton("Суббота")],
-        [KeyboardButton("Вся неделя")],
-    ],
-    resize_keyboard=True,
-)
-
 
 def normalize_day(text: str) -> str | None:
     if not text:
@@ -151,9 +141,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/today — расписание на сегодня\n"
         "/tomorrow — расписание на завтра\n"
         "/week — расписание на всю неделю\n"
-        "Или нажми на кнопки с днями недели."
+        "Или нажми на кнопки ниже."
     )
-    await update.message.reply_text(text, reply_markup=MAIN_KEYBOARD)
+    if update.message:
+        await update.message.reply_text(text)
+    elif update.callback_query:
+        await update.callback_query.message.reply_text(text)
 
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -165,11 +158,11 @@ async def today(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     day_key = weekday_ru_from_date(now)
     if day_key == "воскресенье":
         await update.message.reply_text(
-            "Сегодня воскресенье. Уроков нет.", reply_markup=MAIN_KEYBOARD
+            "Сегодня воскресенье. Уроков нет."
         )
         return
     await update.message.reply_text(
-        format_schedule_for_day(day_key), parse_mode=ParseMode.HTML, reply_markup=MAIN_KEYBOARD
+        format_schedule_for_day(day_key), parse_mode=ParseMode.HTML
     )
 
 
@@ -178,17 +171,17 @@ async def tomorrow(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     day_key = weekday_ru_from_date(now)
     if day_key == "воскресенье":
         await update.message.reply_text(
-            "Завтра воскресенье. Уроков нет.", reply_markup=MAIN_KEYBOARD
+            "Завтра воскресенье. Уроков нет."
         )
         return
     await update.message.reply_text(
-        format_schedule_for_day(day_key), parse_mode=ParseMode.HTML, reply_markup=MAIN_KEYBOARD
+        format_schedule_for_day(day_key), parse_mode=ParseMode.HTML
     )
 
 
 async def week(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
-        full_week_schedule(), parse_mode=ParseMode.HTML, reply_markup=MAIN_KEYBOARD
+        full_week_schedule(), parse_mode=ParseMode.HTML
     )
 
 
@@ -196,6 +189,8 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if not update.message or not update.message.text:
         return
     text = update.message.text.strip().lower()
+
+    # Разрешим обработку текстов и в группах (если у бота есть доступ по настройкам privacy)
 
     if text in {"сегодня"}:
         return await today(update, context)
@@ -207,13 +202,12 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     day_key = normalize_day(text)
     if day_key in SCHEDULE:
         await update.message.reply_text(
-            format_schedule_for_day(day_key), parse_mode=ParseMode.HTML, reply_markup=MAIN_KEYBOARD
+            format_schedule_for_day(day_key), parse_mode=ParseMode.HTML
         )
         return
 
     await update.message.reply_text(
-        "Не понял запрос. Используйте команды /today, /tomorrow, /week или кнопки.",
-        reply_markup=MAIN_KEYBOARD,
+        "Не понял запрос. Используйте команды /today, /tomorrow, /week или напишите день недели (например: Понедельник).",
     )
 
 
